@@ -1,0 +1,63 @@
+# Gradle / Android build state
+.gradle/
+.kotlin/
+**/build/
+local.properties
+
+# Android Studio and local SDKs
+.idea/
+*.iml
+.android-sdk/
+.tools/
+.externalNativeBuild/
+.cxx/
+
+# Signing and credentials
+*.jks
+*.keystore
+signing.properties
+secrets.properties
+*.pem
+*.p12
+*.pfx
+
+# Runtime databases and logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.trace
+*.dump
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artifacts
+*.apk
+*.aab
+
+# Local diagnostics and captures
+captures/
+screenshots/
+diagnostics/
+artifacts/
+
+# Private local project notes
+PROJECT_HANDOFF.md
+
+# Local agent configuration (the public template remains tracked)
+agent/.env
+agent/env.local
+
+# Codex/local automation metadata
+.agents/
+.codex/
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini

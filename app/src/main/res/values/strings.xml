@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Lucid Dream</string>
+    <string name="notification_listener_label">Lucid Dream 消息托管</string>
+    <string name="accessibility_service_label">Lucid Dream 微信回复助手</string>
+    <string name="accessibility_service_description">仅在睡眠托管期间，校验微信聊天内容并代替 Owner 输入和发送 Agent 回复。</string>
+</resources>
