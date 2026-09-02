@@ -1,6 +1,8 @@
 # Lucid Dream
 
-An experimental self-hosted Android AI agent powered by DeepSeek tool calling, local safety policy, and a vision-based Android executor.
+An experimental, self-hosted Android AI agent framework connecting a conversational LLM, a local safety-policy layer, and a vision-based Android executor.
+
+The v1.0 reference implementation uses DeepSeek for owner-side conversation and tool calling, and GLM/Zhipu Vision for Android UI understanding. These providers are implementation choices rather than fundamental architectural requirements. Other providers require compatible client/adapter code and are not supported out of the box in v1.0.
 
 Lucid Dream connects an Android owner chat, local policy enforcement, and a Termux-hosted vision agent. It is a source-first research workflow for developers who are comfortable configuring Android system tools. It is **not** a zero-configuration consumer app, production-ready automation platform, or guarantee that every Android interface can be operated reliably.
 
@@ -11,22 +13,39 @@ Owner
   ↓
 Lucid Dream Android app
   ↓
-DeepSeek chat + official tool calling
+Owner LLM (DeepSeek in v1.0)
+  ↓
+Tool calling
   ↓
 Local RiskClassifier + ToolPolicyEngine
   ↓
-Localhost Agent Server (Termux)
+Android Agent Runtime (Termux + Python)
   ↓
-GLM vision + Mobilerun Portal + Shizuku/rish
+Vision model (GLM/Zhipu in v1.0)
+  ↓
+Mobilerun Portal + Shizuku/rish
   ↓
 Android UI
   ↓
-Tool result → DeepSeek final response
+Tool result → Owner LLM final response
 ```
 
-DeepSeek can propose an Android action, but it cannot grant itself permission. The Android app assigns the request source, classifies risk locally, applies policy, and requires confirmation where appropriate. The Python executor then reasons from screenshots and Android foreground state, performs one bounded UI action at a time, and reports a terminal result.
+The owner model can propose an Android action, but it cannot grant itself permission. The Android app assigns the request source, classifies risk locally, applies policy, and requires confirmation where appropriate. The Python executor then reasons from screenshots and Android foreground state, performs one bounded UI action at a time, and reports a terminal result.
 
 This repository combines the Android application with a v1.0 source snapshot of the Python runtime used by the local Agent Server.
+
+## Reference stack (v1.0)
+
+| Layer | v1.0 implementation |
+| --- | --- |
+| Owner LLM | DeepSeek |
+| Tool orchestration | Lucid Dream Android/Kotlin |
+| Local risk and policy | Lucid Dream |
+| Vision model | GLM / Zhipu Vision |
+| Device execution | Mobilerun Portal + Shizuku/rish |
+| Runtime bridge | Termux + Python Agent Server |
+
+DeepSeek and GLM are the providers integrated by the current reference implementation, not conceptual requirements of the orchestration architecture.
 
 ## v1.0 features
 
@@ -56,7 +75,7 @@ Policy is enforced locally by Kotlin code:
 | `EXTERNAL_UNTRUSTED` | `DENY` |
 | Unknown source, tool, action, or risk | `DENY` |
 
-DeepSeek does **not** choose or override the trusted source, risk category, authorization, or policy decision. Model-provided authorization-like fields are not trusted.
+Model providers do **not** choose or override the trusted source, risk category, authorization, or policy decision. Model-provided authorization-like fields are not trusted.
 
 Passwords, OTPs, PINs, payment credentials, fingerprints, face recognition, new-device verification, and other identity checks remain user-only actions. The Python vision agent also has an authentication-page guard and stops for user handoff.
 
@@ -70,7 +89,7 @@ The Agent Server binds only to `127.0.0.1:8765` and authenticates protected endp
 - Android SDK Platform 36 and compatible Android build tools.
 - The included Gradle 8.13 wrapper.
 
-### Runtime
+### Current v1.0 reference runtime
 
 - An Android device (the project currently targets Android 8.0 / API 26 and later).
 - The Lucid Dream Android app.
@@ -80,7 +99,7 @@ The Agent Server binds only to `127.0.0.1:8765` and authenticates protected endp
 - DeepSeek API access for the Android app.
 - Zhipu/GLM API access for vision inference (`glm-4.6v` in the current runtime).
 
-The Python files in `agent/` use the Python standard library and do not require a Python package installation step. Shizuku, rish, Mobilerun Portal, DeepSeek, and Zhipu are separate products/services and are not bundled in this repository.
+The Python files in `agent/` use the Python standard library and do not require a Python package installation step. DeepSeek and GLM are required by the current v1.0 implementation, but are not permanent architectural requirements. Shizuku, rish, Mobilerun Portal, DeepSeek, and Zhipu are separate products/services and are not bundled in this repository.
 
 ## Credentials
 
@@ -88,10 +107,10 @@ No credentials are included. Each user must obtain or generate their own and kee
 
 | Credential | Purpose | Where it is configured |
 | --- | --- | --- |
-| DeepSeek API Key | Owner Chat and delegation decisions | Lucid Dream **Settings**; encrypted with Android Keystore + AES-GCM |
-| `ZHIPU_API_KEY` | GLM vision inference | Termux environment |
-| `MOBILERUN_TOKEN` | Mobilerun Portal REST/device control | Termux environment |
-| `LUCID_AGENT_TOKEN` | Local bearer authentication between Lucid Dream and the Termux Agent Server | Same value in the Termux environment and Lucid Dream **Settings → Android Agent Token** |
+| DeepSeek API Key | Credential for the v1.0 reference Owner LLM provider | Lucid Dream **Settings**; encrypted with Android Keystore + AES-GCM |
+| `ZHIPU_API_KEY` | Credential for the v1.0 reference vision-model provider | Termux environment |
+| `MOBILERUN_TOKEN` | Authentication for the current Mobilerun Portal-based device execution stack | Termux environment |
+| `LUCID_AGENT_TOKEN` | Locally generated bearer secret for the Lucid Dream App ↔ Termux Agent Server trust boundary | Same value in the Termux environment and Lucid Dream **Settings → Android Agent Token** |
 
 `LUCID_AGENT_TOKEN` is not a third-party API key. Generate it locally, for example:
 
@@ -101,7 +120,17 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 `agent_server.py` reads the value directly from the `LUCID_AGENT_TOKEN` environment variable when it starts. It does not automatically load an env file. The example below explicitly sources a private local file before starting the server.
 
+## Replacing model providers
+
+The current Android client integrates DeepSeek through `DeepSeekClient` and its tool-calling request/response structures. Replacing the Owner LLM requires code that supports normal chat, function/tool calls, tool-result continuation, and final responses while preserving Lucid Dream's local trust and policy boundary.
+
+The current Python executor calls the GLM Vision API directly. A replacement vision provider must accept Android screenshots, understand UI text and spatial relationships, follow the user task, and map its output safely to the existing action contract, including `launch_app`, `tap`, `swipe`, `input_text`, `wait`, and `done`.
+
+No alternative provider adapters or provider-selection UI are included in v1.0. Provider replacement is architectural extensibility, not a drop-in or zero-configuration feature.
+
 ## Quick start
+
+The following steps describe the current v1.0 reference implementation and therefore still require DeepSeek and GLM/Zhipu credentials.
 
 1. **Clone the repository.**
 
@@ -172,6 +201,8 @@ WeChat is not an official open automation surface for personal accounts. UI chan
 ## Current limitations
 
 - One Android tool execution per Owner Chat turn; there is no multi-tool planner yet.
+- The reference implementation currently integrates DeepSeek and GLM directly.
+- Replacing either model provider requires code adaptation; alternatives are not built-in v1.0 options.
 - Only one Android Agent task can control the phone UI at a time.
 - Vision decisions can fail when layouts, text, animations, dialogs, or OEM behavior change.
 - App launch support is dynamic but does not imply reliable operation of every installed app.
@@ -192,6 +223,7 @@ gradle/                    Gradle wrapper files
 build.gradle.kts           Root Android build configuration
 settings.gradle.kts        Gradle project settings
 README.md                  Setup, security model, and operating notes
+LICENSE                    Apache License 2.0 for Lucid Dream repository-owned work
 ```
 
 Local build outputs, credentials, databases, diagnostics, screenshots, SDK installations, and machine-specific configuration are excluded by `.gitignore`.
@@ -214,4 +246,6 @@ python -m unittest -v agent/test_mr_agent_app_launch.py
 
 ## License
 
-No open-source license has been specified yet. Public availability of the source does not by itself grant a license to use, modify, or redistribute it.
+Lucid Dream repository-owned code and content are licensed under the [Apache License 2.0](LICENSE).
+
+Third-party software, libraries, services, APIs, runtime dependencies, and their trademarks remain subject to their respective licenses and terms. This includes Android/Google libraries, Termux, Shizuku/rish, Mobilerun Portal, DeepSeek, and Zhipu/GLM; the Lucid Dream license does not relicense those third-party components or services.
