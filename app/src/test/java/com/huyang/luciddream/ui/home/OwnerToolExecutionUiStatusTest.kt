@@ -134,6 +134,8 @@ class OwnerToolExecutionUiStatusTest {
                 OwnerToolResultStatus.POLLING_TIMEOUT,
             AgentTaskUiStatus.StatusUnknown("task-current", "unknown") to
                 OwnerToolResultStatus.STATUS_UNKNOWN,
+            AgentTaskUiStatus.Cancelled("task-current", "runtime cancelled") to
+                OwnerToolResultStatus.CANCELLED_BY_USER,
         )
 
         cases.forEach { (agentStatus, expectedToolStatus) ->

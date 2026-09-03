@@ -36,6 +36,7 @@ enum class AgentServerTaskStatus(
     BLOCKED("blocked", true),
     FAILED("failed", true),
     MAX_STEPS("max_steps", true),
+    CANCELLED("cancelled", true),
     ;
 
     companion object {
@@ -54,6 +55,11 @@ data class AgentTaskStatusSnapshot(
 sealed interface AgentTaskStatusResult {
     data class Success(val snapshot: AgentTaskStatusSnapshot) : AgentTaskStatusResult
     data class Failure(val message: String) : AgentTaskStatusResult
+}
+
+sealed interface AgentTaskCancelResult {
+    data class Accepted(val snapshot: AgentTaskStatusSnapshot) : AgentTaskCancelResult
+    data class Failure(val message: String) : AgentTaskCancelResult
 }
 
 @Serializable
@@ -92,6 +98,78 @@ class AgentTaskClient @Inject constructor(
             .build()
             .toString()
         return getStatusAt(url, taskId, token)
+    }
+
+    suspend fun cancelTask(taskId: String, token: String): AgentTaskCancelResult {
+        val url = AgentServerConfig.TASKS_URL.toHttpUrl().newBuilder()
+            .addPathSegment(taskId)
+            .addPathSegment("cancel")
+            .build()
+            .toString()
+        return cancelTaskAt(url, taskId, token)
+    }
+
+    internal suspend fun cancelTaskAt(
+        url: String,
+        taskId: String,
+        token: String,
+    ): AgentTaskCancelResult = withContext(Dispatchers.IO) {
+        if (taskId.isBlank()) {
+            return@withContext AgentTaskCancelResult.Failure("task_id 不能为空")
+        }
+        if (token.isBlank()) {
+            return@withContext AgentTaskCancelResult.Failure("缺少 Android Agent Token")
+        }
+
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/json")
+                .post(EMPTY_REQUEST_BODY)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (response.code !in setOf(HTTP_OK, HTTP_ACCEPTED)) {
+                    return@withContext AgentTaskCancelResult.Failure(
+                        httpFailure(response.code),
+                    )
+                }
+
+                val decoded = try {
+                    json.decodeFromString<AgentTaskStatusResponse>(response.body.string())
+                } catch (_: SerializationException) {
+                    return@withContext AgentTaskCancelResult.Failure(
+                        "Agent 取消响应 JSON 无法解析",
+                    )
+                }
+
+                if (decoded.taskId != taskId) {
+                    return@withContext AgentTaskCancelResult.Failure(
+                        "Agent 服务返回的 task_id 不匹配",
+                    )
+                }
+
+                val status = AgentServerTaskStatus.fromWireValue(decoded.status)
+                    ?: return@withContext AgentTaskCancelResult.Failure(
+                        "Agent 服务返回未知任务状态：${decoded.status}",
+                    )
+
+                AgentTaskCancelResult.Accepted(
+                    AgentTaskStatusSnapshot(
+                        taskId = decoded.taskId,
+                        status = status,
+                        reason = decoded.reason,
+                    ),
+                )
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: IOException) {
+            AgentTaskCancelResult.Failure("网络请求失败：${error.diagnosticMessage()}")
+        } catch (error: Exception) {
+            AgentTaskCancelResult.Failure("任务停止请求失败：${error.diagnosticMessage()}")
+        }
     }
 
     internal suspend fun getStatusAt(
@@ -228,8 +306,10 @@ class AgentTaskClient @Inject constructor(
         message?.trim()?.takeIf { it.isNotEmpty() } ?: javaClass.simpleName
 
     private companion object {
+        const val HTTP_OK = 200
         const val HTTP_ACCEPTED = 202
         const val EXPECTED_STATUS = "queued"
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        val EMPTY_REQUEST_BODY = ByteArray(0).toRequestBody(null)
     }
 }

@@ -123,9 +123,16 @@ fun HomeScreen(viewModel: HomeViewModel = hiltViewModel()) {
                 }
             }
             if (state.ownerToolExecutionStatus == OwnerToolExecutionUiStatus.Idle) {
-                AgentTaskStatusCard(state.agentTaskStatus)
+                AgentTaskStatusCard(
+                    status = state.agentTaskStatus,
+                    onCancel = viewModel::cancelActiveAgentTask,
+                )
             }
-            OwnerToolExecutionStatusCard(state.ownerToolExecutionStatus)
+            OwnerToolExecutionStatusCard(
+                status = state.ownerToolExecutionStatus,
+                agentTaskStatus = state.agentTaskStatus,
+                onCancel = viewModel::cancelActiveAgentTask,
+            )
 
             LazyColumn(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -244,7 +251,11 @@ private fun OwnerToolConfirmationDialog(
 }
 
 @Composable
-private fun OwnerToolExecutionStatusCard(status: OwnerToolExecutionUiStatus) {
+private fun OwnerToolExecutionStatusCard(
+    status: OwnerToolExecutionUiStatus,
+    agentTaskStatus: AgentTaskUiStatus,
+    onCancel: () -> Unit,
+) {
     val title: String
     val detail: String
     val isError: Boolean
@@ -252,7 +263,11 @@ private fun OwnerToolExecutionStatusCard(status: OwnerToolExecutionUiStatus) {
         OwnerToolExecutionUiStatus.Idle,
         is OwnerToolExecutionUiStatus.WaitingConfirmation -> return
         is OwnerToolExecutionUiStatus.Executing -> {
-            title = "手机任务正在执行…"
+            title = if (agentTaskStatus is AgentTaskUiStatus.Cancelling) {
+                "正在停止手机任务…"
+            } else {
+                "手机任务正在执行…"
+            }
             detail = status.task
             isError = false
         }
@@ -315,6 +330,15 @@ private fun OwnerToolExecutionStatusCard(status: OwnerToolExecutionUiStatus) {
         ) {
             Text(title, fontWeight = FontWeight.SemiBold)
             Text(detail, style = MaterialTheme.typography.bodyMedium)
+            if (agentTaskStatus.allowsCancellation) {
+                OutlinedButton(onClick = onCancel) { Text("停止任务") }
+            } else if (agentTaskStatus is AgentTaskUiStatus.Cancelling) {
+                Text(
+                    "正在停止…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -369,7 +393,8 @@ private fun AgentTaskSheet(
                     when (status) {
                         AgentTaskUiStatus.Submitting -> "正在提交"
                         is AgentTaskUiStatus.Queued,
-                        is AgentTaskUiStatus.Running -> "执行中"
+                        is AgentTaskUiStatus.Running,
+                        is AgentTaskUiStatus.Cancelling -> "执行中"
                         else -> "执行任务"
                     },
                 )
@@ -397,7 +422,10 @@ private fun AgentTaskSheet(
 }
 
 @Composable
-private fun AgentTaskStatusCard(status: AgentTaskUiStatus) {
+private fun AgentTaskStatusCard(
+    status: AgentTaskUiStatus,
+    onCancel: () -> Unit,
+) {
     val taskId = status.taskId ?: return
     val title: String
     val detail: String?
@@ -412,6 +440,16 @@ private fun AgentTaskStatusCard(status: AgentTaskUiStatus) {
         is AgentTaskUiStatus.Running -> {
             title = "Agent 正在执行…"
             detail = null
+            isError = false
+        }
+        is AgentTaskUiStatus.Cancelling -> {
+            title = "正在停止任务…"
+            detail = null
+            isError = false
+        }
+        is AgentTaskUiStatus.Cancelled -> {
+            title = "任务已停止"
+            detail = status.reason
             isError = false
         }
         is AgentTaskUiStatus.Completed -> {
@@ -464,6 +502,9 @@ private fun AgentTaskStatusCard(status: AgentTaskUiStatus) {
             Text(title, fontWeight = FontWeight.SemiBold)
             detail?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
             Text("task_id: $taskId", style = MaterialTheme.typography.bodySmall)
+            if (status.allowsCancellation) {
+                OutlinedButton(onClick = onCancel) { Text("停止任务") }
+            }
         }
     }
 }

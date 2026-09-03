@@ -9,6 +9,8 @@ import javax.inject.Singleton
 internal enum class AgentTaskToastCue(val text: String) {
     STARTED("开始执行"),
     RUNNING("执行中..."),
+    CANCELLING("正在停止..."),
+    CANCELLED("任务已停止"),
     COMPLETED("执行完毕！"),
     INTERRUPTED("任务中断"),
 }
@@ -35,6 +37,10 @@ internal class AgentTaskToastTransitionTracker {
                 AgentTaskToastCue.RUNNING.takeIf { shouldNotify }
             }
             is AgentTaskUiStatus.Completed -> terminalCue(AgentTaskToastCue.COMPLETED)
+            is AgentTaskUiStatus.Cancelling -> {
+                AgentTaskToastCue.CANCELLING.takeIf { executionStarted }
+            }
+            is AgentTaskUiStatus.Cancelled -> terminalCue(AgentTaskToastCue.CANCELLED)
             is AgentTaskUiStatus.Failed,
             is AgentTaskUiStatus.Blocked,
             is AgentTaskUiStatus.MaxSteps,

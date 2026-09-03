@@ -159,6 +159,81 @@ class AgentTaskClientTest {
         )
     }
 
+    @Test
+    fun cancelledStatusIsParsedAsTerminal() = withTaskServer(
+        responseCode = 200,
+        responseBody = """{"task_id":"task-1","status":"cancelled","reason":"stopped"}""",
+    ) { url, _ ->
+        val result = runBlocking {
+            client.getStatusAt("$url/task-1", "task-1", "token")
+        }
+
+        assertEquals(
+            AgentTaskStatusResult.Success(
+                AgentTaskStatusSnapshot(
+                    "task-1",
+                    AgentServerTaskStatus.CANCELLED,
+                    "stopped",
+                ),
+            ),
+            result,
+        )
+        assertTrue(AgentServerTaskStatus.CANCELLED.isTerminal)
+    }
+
+    @Test
+    fun cancelTaskPostsOnceWithBearerToken() = withTaskServer(
+        responseCode = 202,
+        responseBody = """{"task_id":"task-1","status":"running","cancel_requested":true}""",
+    ) { url, capturedRequest ->
+        val result = runBlocking {
+            client.cancelTaskAt("$url/task-1/cancel", "task-1", "test-token")
+        }
+
+        assertEquals(
+            AgentTaskCancelResult.Accepted(
+                AgentTaskStatusSnapshot("task-1", AgentServerTaskStatus.RUNNING, null),
+            ),
+            result,
+        )
+        assertEquals("POST /tasks/task-1/cancel HTTP/1.1", capturedRequest().requestLine)
+        assertEquals("Bearer test-token", capturedRequest().headers["authorization"])
+    }
+
+    @Test
+    fun cancelTaskParsesImmediateCancelledResponse() = withTaskServer(
+        responseCode = 200,
+        responseBody = """{"task_id":"task-1","status":"cancelled","reason":"stopped"}""",
+    ) { url, _ ->
+        val result = runBlocking {
+            client.cancelTaskAt("$url/task-1/cancel", "task-1", "token")
+        }
+
+        assertEquals(
+            AgentTaskCancelResult.Accepted(
+                AgentTaskStatusSnapshot(
+                    "task-1",
+                    AgentServerTaskStatus.CANCELLED,
+                    "stopped",
+                ),
+            ),
+            result,
+        )
+    }
+
+    @Test
+    fun cancelTaskUnauthorizedReturnsAuthenticationFailure() = withTaskServer(401, "{}") {
+            url, _ ->
+        val result = runBlocking {
+            client.cancelTaskAt("$url/task-1/cancel", "task-1", "bad-token")
+        }
+
+        assertEquals(
+            AgentTaskCancelResult.Failure("Agent 服务鉴权失败（HTTP 401）"),
+            result,
+        )
+    }
+
     private fun withTaskServer(
         responseCode: Int,
         responseBody: String,

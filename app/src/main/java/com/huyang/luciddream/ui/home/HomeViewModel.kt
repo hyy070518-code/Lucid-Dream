@@ -13,6 +13,7 @@ import com.huyang.luciddream.data.entity.OwnerChatMessageEntity
 import com.huyang.luciddream.data.repository.OwnerChatRepository
 import com.huyang.luciddream.session.DelegationManager
 import com.huyang.luciddream.network.AgentTaskClient
+import com.huyang.luciddream.network.AgentTaskCancelResult
 import com.huyang.luciddream.network.AgentServerTaskStatus
 import com.huyang.luciddream.network.AgentTaskPoller
 import com.huyang.luciddream.network.AgentTaskPollingOutcome
@@ -36,6 +37,8 @@ import kotlinx.coroutines.launch
 
 sealed interface AgentTaskUiStatus {
     val allowsSubmission: Boolean
+    val allowsCancellation: Boolean
+        get() = false
     val taskId: String?
         get() = null
 
@@ -49,9 +52,15 @@ sealed interface AgentTaskUiStatus {
 
     data class Queued(override val taskId: String) : AgentTaskUiStatus {
         override val allowsSubmission = false
+        override val allowsCancellation = true
     }
 
     data class Running(override val taskId: String) : AgentTaskUiStatus {
+        override val allowsSubmission = false
+        override val allowsCancellation = true
+    }
+
+    data class Cancelling(override val taskId: String) : AgentTaskUiStatus {
         override val allowsSubmission = false
     }
 
@@ -97,7 +106,21 @@ sealed interface AgentTaskUiStatus {
     data class PreflightFailed(val message: String) : AgentTaskUiStatus {
         override val allowsSubmission = true
     }
+
+    data class Cancelled(
+        override val taskId: String,
+        val reason: String,
+    ) : AgentTaskUiStatus {
+        override val allowsSubmission = true
+    }
 }
+
+internal fun AgentTaskUiStatus.toCancellingOrNull(): AgentTaskUiStatus.Cancelling? =
+    if (allowsCancellation) {
+        taskId?.let(AgentTaskUiStatus::Cancelling)
+    } else {
+        null
+    }
 
 sealed interface OwnerToolExecutionUiStatus {
     data object Idle : OwnerToolExecutionUiStatus
@@ -169,10 +192,15 @@ internal fun HomeInteractionState.withAgentTaskDraft(value: String): HomeInterac
 internal fun HomeInteractionState.withPolledAgentTaskStatus(
     taskId: String,
     status: AgentTaskUiStatus,
-): HomeInteractionState = if (agentTaskStatus.taskId == taskId) {
-    copy(agentTaskStatus = status)
-} else {
-    this
+): HomeInteractionState {
+    if (agentTaskStatus.taskId != taskId) return this
+    if (
+        agentTaskStatus is AgentTaskUiStatus.Cancelling &&
+        (status is AgentTaskUiStatus.Queued || status is AgentTaskUiStatus.Running)
+    ) {
+        return this
+    }
+    return copy(agentTaskStatus = status)
 }
 
 internal fun HomeInteractionState.withAgentAndOwnerToolStatus(
@@ -258,6 +286,11 @@ internal fun OwnerToolExecutionUiStatus.withAgentTaskStatus(
             status.message,
             taskId,
         )
+        is AgentTaskUiStatus.Cancelled -> executing.finished(
+            OwnerToolResultStatus.CANCELLED_BY_USER,
+            status.reason,
+            taskId,
+        )
         else -> this
     }
 }
@@ -294,6 +327,10 @@ internal fun AgentTaskStatusSnapshot.toUiStatus(): AgentTaskUiStatus = when (sta
     AgentServerTaskStatus.MAX_STEPS -> AgentTaskUiStatus.MaxSteps(
         taskId = taskId,
         reason = reason ?: "Agent 达到最大执行步数",
+    )
+    AgentServerTaskStatus.CANCELLED -> AgentTaskUiStatus.Cancelled(
+        taskId = taskId,
+        reason = reason ?: "用户已停止正在运行的 Android Agent 任务",
     )
 }
 
@@ -398,6 +435,49 @@ class HomeViewModel @Inject constructor(
                 }
                 is AgentTaskSubmitResult.Failure -> interaction.update {
                     it.copy(agentTaskStatus = AgentTaskUiStatus.Failed(result.message))
+                }
+            }
+        }
+    }
+
+    fun cancelActiveAgentTask() {
+        val previousStatus = interaction.value.agentTaskStatus
+        val cancelling = previousStatus.toCancellingOrNull() ?: return
+        val token = agentTokenRepository.tokenForRequest()
+        if (token == null) {
+            interaction.update { it.copy(error = "缺少 Android Agent Token，无法停止任务") }
+            return
+        }
+
+        interaction.update { current ->
+            if (current.agentTaskStatus == previousStatus) {
+                current.copy(agentTaskStatus = cancelling, error = null)
+            } else {
+                current
+            }
+        }
+        if (interaction.value.agentTaskStatus != cancelling) return
+
+        viewModelScope.launch {
+            when (val result = agentTaskClient.cancelTask(cancelling.taskId, token)) {
+                is AgentTaskCancelResult.Accepted -> {
+                    if (result.snapshot.status.isTerminal) {
+                        val terminal = result.snapshot.toUiStatus()
+                        interaction.update {
+                            it.withAgentAndOwnerToolStatus(cancelling.taskId, terminal)
+                        }
+                        completeOwnerToolForTask(cancelling.taskId)
+                    }
+                }
+                is AgentTaskCancelResult.Failure -> interaction.update { current ->
+                    if (current.agentTaskStatus == cancelling) {
+                        current.copy(
+                            agentTaskStatus = previousStatus,
+                            error = "停止任务失败：${result.message}",
+                        )
+                    } else {
+                        current
+                    }
                 }
             }
         }

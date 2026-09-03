@@ -60,6 +60,21 @@ class AgentTaskToastTransitionTrackerTest {
     }
 
     @Test
+    fun cancellingAndCancelledHaveDedicatedDeduplicatedCues() {
+        val tracker = runningTracker()
+
+        assertEquals(
+            AgentTaskToastCue.CANCELLING,
+            tracker.onStatusChanged(AgentTaskUiStatus.Cancelling("task-a")),
+        )
+        assertNull(tracker.onStatusChanged(AgentTaskUiStatus.Cancelling("task-a")))
+        assertEquals(
+            AgentTaskToastCue.CANCELLED,
+            tracker.onStatusChanged(AgentTaskUiStatus.Cancelled("task-a", "stopped")),
+        )
+    }
+
+    @Test
     fun secondTaskStillShowsFullLifecycleAfterFirstCompleted() {
         val tracker = runningTracker()
         tracker.onStatusChanged(AgentTaskUiStatus.Completed("task-a", "done"))

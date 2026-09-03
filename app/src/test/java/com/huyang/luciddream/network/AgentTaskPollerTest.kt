@@ -58,6 +58,9 @@ class AgentTaskPollerTest {
     fun runningMaxStepsStopsPolling() = terminalTransitionTest(AgentServerTaskStatus.MAX_STEPS)
 
     @Test
+    fun runningCancelledStopsPolling() = terminalTransitionTest(AgentServerTaskStatus.CANCELLED)
+
+    @Test
     fun pollingStopsAtConfiguredTimeout() = runTest {
         var fetchCount = 0
 

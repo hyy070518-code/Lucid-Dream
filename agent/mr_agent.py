@@ -1029,6 +1029,7 @@ def launch_resolved_app(
     foreground_getter=None,
     sleep_fn=None,
     verification_attempts=4,
+    cancel_check=None,
 ):
     package = resolved.get("package") if isinstance(resolved, dict) else None
     launcher = (
@@ -1078,6 +1079,18 @@ def launch_resolved_app(
     ]
 
     for method, stage, launch in methods:
+        if cancel_check is not None and cancel_check():
+            return {
+                "status": "cancelled",
+                "stage": stage,
+                "package": package,
+                "label": resolved.get("label"),
+                "launcherActivity": launcher,
+                "launchMethod": None,
+                "verifiedForeground": False,
+                "reason": "App launch cancelled before the next launch action",
+                "attempts": attempt_log,
+            }
         try:
             output = launch()
 
@@ -1148,6 +1161,7 @@ def execute_launch_request(
     app_name=None,
     package=None,
     launch_executor=None,
+    cancel_check=None,
 ):
     launch_executor = launch_executor or launch_resolved_app
     print(
@@ -1186,7 +1200,25 @@ def execute_launch_request(
         "LAUNCH_STAGE RESOLVE_LAUNCHER: passed",
         resolution["launcherActivity"]
     )
-    launch_result = launch_executor(resolution)
+    if cancel_check is not None and cancel_check():
+        launch_result = {
+            "status": "cancelled",
+            "stage": "BEFORE_LAUNCH",
+            "package": resolution["package"],
+            "label": resolution.get("label"),
+            "launcherActivity": resolution["launcherActivity"],
+            "launchMethod": None,
+            "verifiedForeground": False,
+            "reason": "App launch cancelled before execution",
+            "attempts": [],
+        }
+    elif cancel_check is None:
+        launch_result = launch_executor(resolution)
+    else:
+        launch_result = launch_executor(
+            resolution,
+            cancel_check=cancel_check,
+        )
 
     for attempt in launch_result.get("attempts", []):
         print(
@@ -1359,6 +1391,7 @@ def call_glm(
     text_input_armed,
     task,
     retry_feedback=None,
+    cancel_event=None,
 ):
     foreground_app = get_foreground_app()
 
@@ -1637,6 +1670,11 @@ blocked 格式：
     body = json.dumps(payload).encode("utf-8")
 
     for attempt in range(1, GLM_REQUEST_ATTEMPTS + 1):
+        if cancellation_requested(cancel_event):
+            return {
+                "status": "cancelled",
+                "reason": "Cancellation observed before GLM request"
+            }
         req = urllib.request.Request(
             GLM_URL,
             data=body,
@@ -1660,7 +1698,11 @@ blocked 格式：
             ):
                 wait = attempt * 5
                 print(f"  GLM繁忙，{wait}秒后重试...")
-                time.sleep(wait)
+                if not interruptible_wait(wait, cancel_event):
+                    return {
+                        "status": "cancelled",
+                        "reason": "Cancellation observed during GLM retry wait"
+                    }
                 continue
 
             print("GLM 请求失败（HTTP/API）:", e.code)
@@ -1683,7 +1725,11 @@ blocked 格式：
                 wait = attempt * 3
                 print(f"  网络异常：{e}")
                 print(f"  {wait}秒后重试...")
-                time.sleep(wait)
+                if not interruptible_wait(wait, cancel_event):
+                    return {
+                        "status": "cancelled",
+                        "reason": "Cancellation observed during GLM retry wait"
+                    }
                 continue
 
             print("GLM 请求失败（网络重试耗尽）:", e)
@@ -1957,8 +2003,48 @@ def update_text_input_armed(current_state, action):
     return current_state
 
 
-def run_agent(task):
+def cancellation_requested(cancel_event):
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def interruptible_wait(seconds, cancel_event=None, interval=0.2):
+    deadline = time.monotonic() + max(0.0, float(seconds))
+
+    while True:
+        if cancellation_requested(cancel_event):
+            return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+
+        wait_time = min(max(0.05, interval), remaining)
+        if cancel_event is not None and hasattr(cancel_event, "wait"):
+            if cancel_event.wait(wait_time):
+                return False
+        else:
+            time.sleep(wait_time)
+
+
+def run_agent(task, cancel_event=None):
     global PORTAL_TOKEN, ZHIPU_KEY
+
+    cancelled_reason = (
+        "The running Android Agent task was cancelled by the user."
+    )
+
+    def cancellation_result(phase):
+        if not cancellation_requested(cancel_event):
+            return None
+        print("CANCELLATION_OBSERVED:", phase)
+        return {
+            "status": "cancelled",
+            "reason": cancelled_reason,
+        }
+
+    cancelled = cancellation_result("before_task_validation")
+    if cancelled is not None:
+        return cancelled
 
     if not isinstance(task, str) or not task.strip():
         reason = "任务为空，无法执行"
@@ -2020,6 +2106,15 @@ def run_agent(task):
             "reason": reason
         }
 
+    def finish_if_cancelled(phase):
+        cancelled_result = cancellation_result(phase)
+        if cancelled_result is None:
+            return None
+        return finish(
+            cancelled_result["status"],
+            cancelled_result["reason"],
+        )
+
     print()
     print("================================")
     print("Mobilerun Vision Agent")
@@ -2040,10 +2135,19 @@ def run_agent(task):
             "CONTROL_PLANE_FAST_PATH:",
             f"明确的单一 App 启动任务，target={launch_target!r}"
         )
+        cancelled = finish_if_cancelled("before_fast_path_launch")
+        if cancelled is not None:
+            return cancelled
+
         fast_path = execute_launch_request(
             app_resolver=app_resolver,
             app_name=launch_target,
+            cancel_check=lambda: cancellation_requested(cancel_event),
         )
+
+        cancelled = finish_if_cancelled("after_fast_path_launch")
+        if cancelled is not None:
+            return cancelled
 
         if fast_path["status"] == "success":
             launch_result = fast_path["launch"]
@@ -2063,9 +2167,14 @@ def run_agent(task):
             "回到 Vision loop，由 GLM 提供进一步信息。"
         )
 
-    time.sleep(START_DELAY)
+    if not interruptible_wait(START_DELAY, cancel_event):
+        return finish("cancelled", cancelled_reason)
 
     for step in range(1, MAX_STEPS + 1):
+
+        cancelled = finish_if_cancelled("before_step")
+        if cancelled is not None:
+            return cancelled
 
         print()
         print(f"===== Step {step}/{MAX_STEPS} =====")
@@ -2087,6 +2196,10 @@ def run_agent(task):
                 screenshot_failure_reason = f"截图失败: {e}"
                 break
 
+            cancelled = finish_if_cancelled("after_screenshot")
+            if cancelled is not None:
+                return cancelled
+
             if inference_attempt == 1:
                 print("截图完成，正在让 GLM 判断...")
             else:
@@ -2104,6 +2217,7 @@ def run_agent(task):
                         if inference_attempt > 1
                         else None
                     ),
+                    cancel_event=cancel_event,
                 )
             except Exception as e:
                 print(
@@ -2115,6 +2229,10 @@ def run_agent(task):
                     "status": "request_failed",
                     "reason": "GLM 调用出现未处理异常"
                 }
+
+            cancelled = finish_if_cancelled("after_inference")
+            if cancelled is not None:
+                return cancelled
 
             glm_status = glm_result.get("status")
 
@@ -2143,6 +2261,10 @@ def run_agent(task):
                 response = glm_result["content"]
                 action = parse_action(response)
 
+                cancelled = finish_if_cancelled("after_parse_action")
+                if cancelled is not None:
+                    return cancelled
+
                 if action:
                     break
 
@@ -2160,7 +2282,8 @@ def run_agent(task):
                     "本步尚未执行任何手机动作，"
                     "将重新截图并重试一次推理..."
                 )
-                time.sleep(1)
+                if not interruptible_wait(1, cancel_event):
+                    return finish("cancelled", cancelled_reason)
 
         if screenshot_failed:
             return finish(
@@ -2180,6 +2303,10 @@ def run_agent(task):
             )
 
         kind = action.get("action")
+
+        cancelled = finish_if_cancelled("before_action_dispatch")
+        if cancelled is not None:
+            return cancelled
 
         if kind == "done":
             print()
@@ -2204,7 +2331,8 @@ def run_agent(task):
             seconds = max(1, min(seconds, 10))
 
             print(f"等待 {seconds} 秒...")
-            time.sleep(seconds)
+            if not interruptible_wait(seconds, cancel_event):
+                return finish("cancelled", cancelled_reason)
 
             record_action(action_history, {
                 "step": step,
@@ -2219,6 +2347,9 @@ def run_agent(task):
             print("原因:", action.get("reason", ""))
 
             try:
+                cancelled = finish_if_cancelled("before_back_action")
+                if cancelled is not None:
+                    return cancelled
                 result = portal_global(1)
                 print("Portal:", result)
 
@@ -2236,7 +2367,8 @@ def run_agent(task):
                 print("返回失败:", e)
                 return finish("failed", f"返回失败: {e}")
 
-            time.sleep(2)
+            if not interruptible_wait(2, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         if kind == "home":
@@ -2244,6 +2376,9 @@ def run_agent(task):
             print("原因:", action.get("reason", ""))
 
             try:
+                cancelled = finish_if_cancelled("before_home_action")
+                if cancelled is not None:
+                    return cancelled
                 result = portal_global(2)
                 print("Portal:", result)
 
@@ -2261,7 +2396,8 @@ def run_agent(task):
                 print("Home失败:", e)
                 return finish("failed", f"Home失败: {e}")
 
-            time.sleep(2)
+            if not interruptible_wait(2, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         if kind == "input_text":
@@ -2313,7 +2449,8 @@ def run_agent(task):
                     "reason": input_safety["reason"]
                 })
                 text_input_armed = False
-                time.sleep(1)
+                if not interruptible_wait(1, cancel_event):
+                    return finish("cancelled", cancelled_reason)
                 continue
 
             if not input_text_precondition_met(text_input_armed):
@@ -2330,7 +2467,8 @@ def run_agent(task):
                     "reason": rejection_reason
                 })
                 text_input_armed = False
-                time.sleep(1)
+                if not interruptible_wait(1, cancel_event):
+                    return finish("cancelled", cancelled_reason)
                 continue
 
             text_input_armed = update_text_input_armed(
@@ -2344,6 +2482,9 @@ def run_agent(task):
             print("原因:", action.get("reason", ""))
 
             try:
+                cancelled = finish_if_cancelled("before_input_text_action")
+                if cancelled is not None:
+                    return cancelled
                 result = shizuku_input_text(
                     text,
                     clear=True
@@ -2364,7 +2505,11 @@ def run_agent(task):
                 print("输入失败:", e)
                 return finish("failed", f"输入失败: {e}")
 
-            time.sleep(2)
+            cancelled = finish_if_cancelled("after_input_text_action")
+            if cancelled is not None:
+                return cancelled
+            if not interruptible_wait(2, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         if kind == "launch_app":
@@ -2374,7 +2519,12 @@ def run_agent(task):
                 app_resolver=app_resolver,
                 app_name=requested_app,
                 package=requested_package,
+                cancel_check=lambda: cancellation_requested(cancel_event),
             )
+
+            cancelled = finish_if_cancelled("after_launch_app_action")
+            if cancelled is not None:
+                return cancelled
             resolution = execution["resolution"]
 
             if resolution.get("status") != "resolved":
@@ -2421,7 +2571,8 @@ def run_agent(task):
                     f"已打开 {app_name}"
                 )
 
-            time.sleep(3)
+            if not interruptible_wait(3, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         if kind == "swipe":
@@ -2464,6 +2615,9 @@ def run_agent(task):
             )
 
             try:
+                cancelled = finish_if_cancelled("before_swipe_action")
+                if cancelled is not None:
+                    return cancelled
                 result = portal_swipe(
                     x1, y1, x2, y2, duration
                 )
@@ -2483,7 +2637,11 @@ def run_agent(task):
                 print("滑动失败:", e)
                 return finish("failed", f"滑动失败: {e}")
 
-            time.sleep(2)
+            cancelled = finish_if_cancelled("after_swipe_action")
+            if cancelled is not None:
+                return cancelled
+            if not interruptible_wait(2, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         if kind == "tap":
@@ -2519,6 +2677,9 @@ def run_agent(task):
             print(f"真实像素: ({x}, {y})")
 
             try:
+                cancelled = finish_if_cancelled("before_tap_action")
+                if cancelled is not None:
+                    return cancelled
                 result = portal_tap(x, y)
                 print("Portal:", result)
 
@@ -2539,7 +2700,11 @@ def run_agent(task):
                 return finish("failed", f"点击失败: {e}")
 
             # 给新界面一点加载时间
-            time.sleep(2)
+            cancelled = finish_if_cancelled("after_tap_action")
+            if cancelled is not None:
+                return cancelled
+            if not interruptible_wait(2, cancel_event):
+                return finish("cancelled", cancelled_reason)
             continue
 
         print("未知动作:", action)

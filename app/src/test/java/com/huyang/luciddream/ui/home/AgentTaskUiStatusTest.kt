@@ -1,5 +1,7 @@
 package com.huyang.luciddream.ui.home
 
+import com.huyang.luciddream.network.AgentServerTaskStatus
+import com.huyang.luciddream.network.AgentTaskStatusSnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -24,6 +26,73 @@ class AgentTaskUiStatusTest {
         assertFalse(AgentTaskUiStatus.Submitting.allowsSubmission)
         assertFalse(AgentTaskUiStatus.Queued("task-123").allowsSubmission)
         assertFalse(AgentTaskUiStatus.Running("task-123").allowsSubmission)
+        assertFalse(AgentTaskUiStatus.Cancelling("task-123").allowsSubmission)
+    }
+
+    @Test
+    fun queuedAndRunningExposeStopWhileCancellingDeduplicatesIt() {
+        assertTrue(AgentTaskUiStatus.Queued("task-123").allowsCancellation)
+        assertTrue(AgentTaskUiStatus.Running("task-123").allowsCancellation)
+        assertEquals(
+            AgentTaskUiStatus.Cancelling("task-123"),
+            AgentTaskUiStatus.Running("task-123").toCancellingOrNull(),
+        )
+        assertFalse(AgentTaskUiStatus.Cancelling("task-123").allowsCancellation)
+        assertEquals(null, AgentTaskUiStatus.Cancelling("task-123").toCancellingOrNull())
+    }
+
+    @Test
+    fun pollingCannotUndoCancellingUntilTerminalStatusArrives() {
+        val cancelling = HomeInteractionState(
+            agentTaskStatus = AgentTaskUiStatus.Cancelling("task-123"),
+        )
+
+        assertEquals(
+            cancelling,
+            cancelling.withPolledAgentTaskStatus(
+                "task-123",
+                AgentTaskUiStatus.Running("task-123"),
+            ),
+        )
+        assertEquals(
+            AgentTaskUiStatus.Cancelled("task-123", "stopped"),
+            cancelling.withPolledAgentTaskStatus(
+                "task-123",
+                AgentTaskUiStatus.Cancelled("task-123", "stopped"),
+            ).agentTaskStatus,
+        )
+    }
+
+    @Test
+    fun cancelledServerStatusMapsToCancelledAndNeverCompleted() {
+        val status = AgentTaskStatusSnapshot(
+            taskId = "task-123",
+            status = AgentServerTaskStatus.CANCELLED,
+            reason = "runtime stopped",
+        ).toUiStatus()
+
+        assertEquals(
+            AgentTaskUiStatus.Cancelled("task-123", "runtime stopped"),
+            status,
+        )
+        assertFalse(status is AgentTaskUiStatus.Completed)
+    }
+
+    @Test
+    fun independentCancellationDoesNotCreateOwnerToolContinuationState() {
+        val state = HomeInteractionState(
+            agentTaskStatus = AgentTaskUiStatus.Running("task-123"),
+            ownerToolExecutionStatus = OwnerToolExecutionUiStatus.Idle,
+        ).withAgentAndOwnerToolStatus(
+            "task-123",
+            AgentTaskUiStatus.Cancelled("task-123", "runtime stopped"),
+        )
+
+        assertEquals(
+            AgentTaskUiStatus.Cancelled("task-123", "runtime stopped"),
+            state.agentTaskStatus,
+        )
+        assertEquals(OwnerToolExecutionUiStatus.Idle, state.ownerToolExecutionStatus)
     }
 
     @Test
@@ -55,6 +124,11 @@ class AgentTaskUiStatusTest {
     @Test
     fun pollingTimeoutTaskCanOpenCleanNewTask() {
         assertOpensCleanNewTask(AgentTaskUiStatus.PollingTimeout("old-task"))
+    }
+
+    @Test
+    fun cancelledTaskCanOpenCleanNewTask() {
+        assertOpensCleanNewTask(AgentTaskUiStatus.Cancelled("old-task", "stopped"))
     }
 
     @Test

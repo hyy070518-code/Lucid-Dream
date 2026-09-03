@@ -1,4 +1,5 @@
 import hmac
+import inspect
 import json
 import os
 import sys
@@ -22,7 +23,10 @@ TERMINAL_TASK_STATUSES = {
     "blocked",
     "failed",
     "max_steps",
+    "cancelled",
 }
+
+CANCELLED_REASON = "The running Android Agent task was cancelled by the user."
 
 
 class AgentHTTPServer(ThreadingHTTPServer):
@@ -49,8 +53,21 @@ class AgentHTTPServer(ThreadingHTTPServer):
     def _now():
         return datetime.now(timezone.utc).isoformat()
 
-    def execute_agent(self, task):
-        result = self.run_agent_func(task)
+    def execute_agent(self, task, cancel_event=None):
+        try:
+            parameters = inspect.signature(self.run_agent_func).parameters.values()
+            accepts_cancel_event = any(
+                parameter.name == "cancel_event"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_cancel_event = False
+
+        if accepts_cancel_event:
+            result = self.run_agent_func(task, cancel_event=cancel_event)
+        else:
+            result = self.run_agent_func(task)
 
         if not isinstance(result, dict):
             raise TypeError("run_agent must return a JSON object")
@@ -93,14 +110,28 @@ class AgentHTTPServer(ThreadingHTTPServer):
             self.tasks.pop(record["task_id"], None)
 
     def _run_task_worker(self, task_id):
+        run_lock_released = False
         try:
             with self.tasks_lock:
                 record = self.tasks[task_id]
+                if (
+                    record["status"] == "cancelled"
+                    or record["cancel_event"].is_set()
+                ):
+                    self.run_lock.release()
+                    run_lock_released = True
+                    record["status"] = "cancelled"
+                    record["reason"] = CANCELLED_REASON
+                    record["finished_at"] = self._now()
+                    self._cleanup_tasks_locked()
+                    return
                 record["status"] = "running"
                 record["started_at"] = self._now()
+                task = record["task"]
+                cancel_event = record["cancel_event"]
 
             try:
-                result = self.execute_agent(record["task"])
+                result = self.execute_agent(task, cancel_event=cancel_event)
             except Exception:
                 traceback.print_exc()
                 result = {
@@ -110,13 +141,16 @@ class AgentHTTPServer(ThreadingHTTPServer):
 
             with self.tasks_lock:
                 record = self.tasks[task_id]
+                self.run_lock.release()
+                run_lock_released = True
                 record["status"] = result["status"]
                 record["reason"] = result["reason"]
                 record["finished_at"] = self._now()
                 self._cleanup_tasks_locked()
 
         finally:
-            self.run_lock.release()
+            if not run_lock_released:
+                self.run_lock.release()
 
     def start_task(self, task):
         if not self.run_lock.acquire(blocking=False):
@@ -131,6 +165,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
             "started_at": None,
             "finished_at": None,
             "reason": None,
+            "cancel_event": threading.Event(),
         }
 
         with self.tasks_lock:
@@ -170,9 +205,31 @@ class AgentHTTPServer(ThreadingHTTPServer):
 
             return result
 
+    def cancel_task(self, task_id):
+        with self.tasks_lock:
+            record = self.tasks.get(task_id)
+
+            if record is None:
+                return None
+
+            if record["status"] in TERMINAL_TASK_STATUSES:
+                return {
+                    "task_id": record["task_id"],
+                    "status": record["status"],
+                    "reason": record["reason"],
+                }
+
+            record["cancel_event"].set()
+
+            return {
+                "task_id": record["task_id"],
+                "status": record["status"],
+                "cancel_requested": True,
+            }
+
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
-    server_version = "LucidAgentServer/0.2"
+    server_version = "LucidAgentServer/0.3"
     sys_version = ""
 
     def _send_json(self, status_code, payload):
@@ -195,6 +252,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         path_parts = self._request_path().strip("/").split("/")
 
         if len(path_parts) != 2 or path_parts[0] != "tasks":
+            return None
+
+        return path_parts[1] or None
+
+    def _cancel_task_id_from_path(self):
+        path_parts = self._request_path().strip("/").split("/")
+
+        if (
+            len(path_parts) != 3
+            or path_parts[0] != "tasks"
+            or path_parts[2] != "cancel"
+        ):
             return None
 
         return path_parts[1] or None
@@ -356,8 +425,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_path = self._request_path()
+        cancel_task_id = self._cancel_task_id_from_path()
 
-        if request_path not in {"/run", "/tasks"}:
+        if request_path not in {"/run", "/tasks"} and cancel_task_id is None:
             self._send_json(
                 404,
                 {
@@ -369,6 +439,19 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         if not self._is_authorized():
             self._send_unauthorized()
+            return
+
+        if cancel_task_id is not None:
+            result = self.server.cancel_task(cancel_task_id)
+
+            if result is None:
+                self._send_json(404, {"status": "not_found"})
+                return
+
+            self._send_json(
+                202 if result.get("cancel_requested") else 200,
+                result,
+            )
             return
 
         task, error = self._read_task()
